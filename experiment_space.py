@@ -372,6 +372,43 @@ class OutcomeDef:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# _CombinedAxisDef  —  internal: axis produced by squeeze() when folding >1 axes
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class _CombinedAxisDef(AxisDef):
+    """
+    AxisDef for the combined (folded) axis produced by SelectionResult.squeeze().
+
+    values  : list of tuples, one per cartesian-product combination.
+    fold_axes : the original AxisDefs that were folded together.
+
+    label() joins the individual per-axis label strings with " / ".
+    axis_label is "ax_a × ax_b × ..." with units if all axes share one unit.
+    """
+
+    fold_axes: list["AxisDef"] = field(default_factory=list)
+
+    def __post_init__(self):
+        # Bypass AxisDef.__post_init__ uniqueness check — tuple values are
+        # always unique by construction (cartesian product).
+        if self.scale not in ("linear", "log"):
+            raise ValueError(f"_CombinedAxisDef: scale must be 'linear' or 'log'")
+
+    def label(self, value: Any) -> str:
+        """Join per-axis labels: (1, "A", 10) → '1 mm / A / 10 Hz'."""
+        if isinstance(value, tuple):
+            return " / ".join(ax.label(v) for ax, v in zip(self.fold_axes, value))
+        # Single-axis fold (shouldn't reach here, but safe fallback)
+        return str(value)
+
+    @property
+    def axis_label(self) -> str:
+        return self.name
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SelectionResult  —  named container returned by ExperimentSpace.select()
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -588,6 +625,147 @@ class SelectionResult:
         fig.suptitle(title, y=1.02)
         fig.tight_layout()
         return fig
+
+    # ── Squeeze ───────────────────────────────────────────────────────────────
+
+    def squeeze(self, axes: list[str]) -> "SelectionResult":
+        """
+        Reshape the tensor into at most (1 + len(axes)) dimensions.
+
+        Parameters
+        ----------
+        axes
+            Up to 3 axis names to keep as independent dimensions, in the
+            order you want them to appear in the output (after the combined
+            axis).  Names follow the same "p:" / "o:" qualification rules as
+            select(), but bare names are almost always unambiguous here since
+            the SelectionResult already has a flat axis list.
+
+        Returns
+        -------
+        A new SelectionResult whose tensor has shape:
+
+            (N_combined, d0, d1, d2)
+
+        where N_combined = product of all sizes NOT in `axes`, and d0/d1/d2
+        are the sizes of the named axes in the order given.
+
+        If every axis is named, no combined axis is produced and the tensor
+        is simply reordered to match the requested axis order.
+
+        The returned axes list is:
+
+            [combined_axisdef, axisdef_0, axisdef_1, ...]
+
+        where combined_axisdef has:
+            name   = "ax_a × ax_b × ..."   (joined names of collapsed axes)
+            values = list of tuples, one per combination (cartesian product)
+            unit   = None
+            scale  = "linear"
+
+        and each label is  "val_a / val_b / ..."  joining the individual
+        AxisDef.label() strings for that combination.
+
+        Examples
+        --------
+            # tensor shape (3, 3, 3, 2, 3, 4)  — 6 param axes
+            r = space.select("spectrum", axes={...})  # shape e.g. (3,2,51)
+            sq = r.squeeze(["frequency"])   # keep freq bins, fold the rest
+            # sq.tensor.shape == (6, 51)
+            # sq.axes[0] is the combined AxisDef with 6 tuple values
+            # sq.axes[1] is the frequency AxisDef
+
+            # Keep two independent axes
+            sq2 = r.squeeze(["thickness", "frequency"])
+            # sq2.tensor.shape == (2, 3, 51)  if thickness had 3→2 selected
+        """
+        from itertools import product as iproduct
+
+        if len(axes) > 3:
+            raise ValueError(
+                f"squeeze: at most 3 axes may be kept independently, "
+                f"got {len(axes)}: {axes}"
+            )
+
+        # ── Resolve requested axis names to positions in self.axes ───────────
+        keep_positions: list[int] = []
+        seen: set[int] = set()
+        for name in axes:
+            bare = name[2:] if name.startswith(("p:", "o:")) else name
+            found = [i for i, ax in enumerate(self.axes) if ax.name == bare]
+            if not found:
+                raise KeyError(
+                    f"squeeze: '{bare}' not found in axes {[a.name for a in self.axes]}"
+                )
+            if len(found) > 1:
+                raise ValueError(
+                    f"squeeze: '{bare}' matches multiple axes at positions "
+                    f"{found}. Use 'p:' / 'o:' prefix to disambiguate."
+                )
+            if found[0] in seen:
+                raise ValueError(f"squeeze: axis '{bare}' listed more than once")
+            keep_positions.append(found[0])
+            seen.add(found[0])
+
+        all_positions = list(range(self.tensor.ndim))
+        fold_positions = [i for i in all_positions if i not in seen]
+
+        # ── Reorder tensor: fold axes first, then keep axes in requested order
+        new_order = fold_positions + keep_positions
+        t = np.transpose(self.tensor, new_order)
+        # t.shape == (*fold_dims, *keep_dims)
+
+        n_fold = len(fold_positions)
+        n_keep = len(keep_positions)
+
+        fold_axes = [self.axes[i] for i in fold_positions]
+        keep_axes = [self.axes[i] for i in keep_positions]
+
+        # ── Reshape fold dims into one combined axis ──────────────────────────
+        fold_shape = t.shape[:n_fold]  # sizes of each folded axis
+        keep_shape = t.shape[n_fold:]  # sizes of each kept axis
+
+        if n_fold == 0:
+            # All axes named — just reorder, no combined axis
+            return SelectionResult(
+                outcome=self.outcome,
+                tensor=t,
+                axes=keep_axes,
+            )
+
+        N_combined = int(np.prod(fold_shape)) if fold_shape else 1
+        t_reshaped = t.reshape(N_combined, *keep_shape)
+
+        # ── Build combined AxisDef ────────────────────────────────────────────
+        # values: cartesian product of each folded axis's values, as tuples
+        # For a single folded axis, wrap each value in a 1-tuple for consistency
+        fold_value_lists = [ax.values for ax in fold_axes]
+        combo_values = list(iproduct(*fold_value_lists))
+        # 1-tuple → unwrap to bare value (cleaner labels when only one fold axis)
+        if len(fold_axes) == 1:
+            combo_values = [v[0] for v in combo_values]
+
+        # Build a custom AxisDef subclass that overrides label() for tuples
+        combined_name = " × ".join(ax.name for ax in fold_axes)
+
+        if len(fold_axes) == 1:
+            # Single folded axis — reuse its unit and scale for labelling
+            fa = fold_axes[0]
+            combined_ax = AxisDef(combined_name, combo_values, fa.unit, fa.scale)
+        else:
+            # Multi-axis fold — labels are "v_a / v_b / ..." joined strings
+            # We store tuples as values; override label via a thin subclass
+            combined_ax = _CombinedAxisDef(
+                name=combined_name,
+                values=combo_values,
+                fold_axes=fold_axes,
+            )
+
+        return SelectionResult(
+            outcome=self.outcome,
+            tensor=t_reshaped,
+            axes=[combined_ax] + keep_axes,
+        )
 
     def __repr__(self) -> str:
         axes_str = ", ".join(f"{ax.axis_label}({ax.n})" for ax in self.axes)
@@ -1456,6 +1634,60 @@ if __name__ == "__main__":
     except KeyError as e:
         print(f"   no-unit axis:  {e}")
 
+    # ── squeeze() ─────────────────────────────────────────────────────────────
+
+    print("\n── squeeze() ────────────────────────────────────")
+
+    # Start with a selection that has multiple free axes
+    r_multi = space.select(
+        "spectrum",
+        axes={
+            "p:frequency": 10,  # fix drive frequency
+            "o:frequency": FREQ_BINS[:10],  # keep first 10 freq bins
+        },
+    )
+    print(f"   before squeeze: {r_multi!r}")
+    # shape: (thickness=3, mode=3, temperature=2, material=3, sample_rate=4, freq_bins=10)
+
+    # Keep only freq bins as independent; fold everything else into combined
+    sq1 = r_multi.squeeze(["frequency"])
+    print(f"\n   squeeze(['frequency']):")
+    print(f"   shape               : {sq1.shape}")
+    print(f"   axes                : {[a.name for a in sq1.axes]}")
+    print(f"   combined n          : {sq1.axes[0].n}")
+    print(f"   combined values[:2] : {sq1.axes[0].values[:2]}")
+    print(f"   combined labels[:2] : {sq1.axes[0].labels[:2]}")
+    print(f"   freq bin labels[:4] : {sq1.axes[1].labels[:4]}")
+
+    # Keep two independent axes: thickness and freq bins
+    sq2 = r_multi.squeeze(["thickness", "frequency"])
+    print(f"\n   squeeze(['thickness', 'frequency']):")
+    print(f"   shape               : {sq2.shape}")
+    print(f"   axes                : {[a.name for a in sq2.axes]}")
+    print(f"   combined n          : {sq2.axes[0].n}")
+    print(f"   combined vals[:2]   : {sq2.axes[0].values[:2]}")
+    print(f"   combined lbl[:2]    : {sq2.axes[0].labels[:2]}")
+    print(f"   thickness labels    : {sq2.axes[1].labels}")
+    print(f"   freq bin labels[:4] : {sq2.axes[2].labels[:4]}")
+
+    # All axes named — reorder only, no combined axis
+    r_small = space.select(
+        "spectrum",
+        axes={
+            "p:frequency": 10,
+            "mode": "low",
+            "temperature": 20,
+            "material": "A",
+            "sample_rate": 1000,
+            "o:frequency": FREQ_BINS[:5],
+        },
+    )
+    print(f"\n   before reorder: {r_small!r}")
+    sq3 = r_small.squeeze(["frequency", "thickness"])  # reorder: freq first
+    print(f"   squeeze(['frequency','thickness']) — reorder only:")
+    print(f"   shape : {sq3.shape}")
+    print(f"   axes  : {[a.name for a in sq3.axes]}")
+
     # ── SelectionResult.plot() ───────────────────────────────────────────────
 
     print("\n── plot() demonstrations ────────────────────────")
@@ -1474,8 +1706,7 @@ if __name__ == "__main__":
     )
     print(f"   1-D: {r_1d!r}")
     fig1 = r_1d.plot(title="Feature means — 2mm/10Hz/mid")
-    plt.show()
-    # fig1.savefig("/mnt/user-data/outputs/plot_1d.png", dpi=120, bbox_inches="tight")
+    fig1.savefig("plot_1d.png", dpi=120, bbox_inches="tight")
     print("   saved plot_1d.png")
 
     # 2-D: spectrum outcome, thickness × frequency bins (restricted)
@@ -1492,8 +1723,7 @@ if __name__ == "__main__":
     )
     print(f"   2-D: {r_2d!r}")
     fig2 = r_2d.plot(title="Spectrum — thickness × frequency bins")
-    plt.show()
-    # fig2.savefig("/mnt/user-data/outputs/plot_2d.png", dpi=120, bbox_inches="tight")
+    fig2.savefig("plot_2d.png", dpi=120, bbox_inches="tight")
     print("   saved plot_2d.png")
 
     # 3-D: feature_stats — thickness × feature × statistic, fix remaining params
@@ -1511,8 +1741,7 @@ if __name__ == "__main__":
     )
     print(f"   3-D: {r_3d!r}")
     fig3 = r_3d.plot(title="Feature stats — thickness × feature × statistic")
-    plt.show()
-    # fig3.savefig("/mnt/user-data/outputs/plot_3d.png", dpi=120, bbox_inches="tight")
+    fig3.savefig("plot_3d.png", dpi=120, bbox_inches="tight")
     print("   saved plot_3d.png")
 
     plt.close("all")
