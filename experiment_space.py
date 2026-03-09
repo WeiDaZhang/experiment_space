@@ -695,24 +695,59 @@ class SelectionResult:
             )
 
         # ── Resolve requested axis names to positions in self.axes ───────────
+        # self.axes is in definition order: surviving params first, then
+        # surviving outcome dim_axes.  We count how many param axes survived
+        # to know where the boundary is, enabling "p:" / "o:" disambiguation
+        # without needing any tag stored on the AxisDef objects.
+        #
+        # n_param_axes: number of param axes in this SelectionResult
+        # (needed only when the same name appears in both halves)
+        n_param_axes = sum(
+            1
+            for ax in self.axes
+            if ax in self.axes  # placeholder — computed below from structure
+        )
+        # Derive n_param_axes by counting axes whose name matches a parameter
+        # name in the space — but SelectionResult doesn't hold a reference to
+        # the space.  Instead, use position: axes[i] is a param axis iff i < k
+        # where k is the number of surviving (non-collapsed) parameter axes.
+        # We can infer k because select() always places params before outcome axes.
+        # The total number of surviving axes = len(self.axes); we need to split.
+        # Simple reliable approach: the axes list is definition-order, so
+        # p:X always appears before o:X when both survive.  For disambiguation,
+        # "p:" → pick the FIRST match; "o:" → pick the LAST match.
+        # This is valid because params precede outcome axes in definition order.
+
         keep_positions: list[int] = []
         seen: set[int] = set()
         for name in axes:
-            bare = name[2:] if name.startswith(("p:", "o:")) else name
+            if name.startswith("p:"):
+                bare, pick = name[2:], "first"
+            elif name.startswith("o:"):
+                bare, pick = name[2:], "last"
+            else:
+                bare, pick = name, None
+
             found = [i for i, ax in enumerate(self.axes) if ax.name == bare]
             if not found:
                 raise KeyError(
                     f"squeeze: '{bare}' not found in axes {[a.name for a in self.axes]}"
                 )
+
             if len(found) > 1:
-                raise ValueError(
-                    f"squeeze: '{bare}' matches multiple axes at positions "
-                    f"{found}. Use 'p:' / 'o:' prefix to disambiguate."
-                )
-            if found[0] in seen:
-                raise ValueError(f"squeeze: axis '{bare}' listed more than once")
-            keep_positions.append(found[0])
-            seen.add(found[0])
+                if pick is None:
+                    raise ValueError(
+                        f"squeeze: '{bare}' matches multiple axes at positions "
+                        f"{found}. Use 'p:{bare}' or 'o:{bare}' to disambiguate."
+                    )
+                pos = found[0] if pick == "first" else found[-1]
+            else:
+                pos = found[0]
+
+            if pos in seen:
+                raise ValueError(f"squeeze: axis '{name}' listed more than once")
+            keep_positions.append(pos)
+            seen.add(pos)
 
         all_positions = list(range(self.tensor.ndim))
         fold_positions = [i for i in all_positions if i not in seen]
@@ -1073,14 +1108,10 @@ class ExperimentSpace:
 
         param_sel, outcome_sel = self._resolve_axes(od, axes)
 
-        n_param = len(self._param_dims)
-
-        # ── Build numpy index tuple ───────────────────────────────────────────
-        # We index the full sub-tensor shape: (*param_dims, *out_shape)
-        # For each axis position:
-        #   not in sel  → slice(None)   keep all
-        #   scalar sel  → int           collapse axis
-        #   list sel    → list[int]     fancy index, keep axis
+        # ── Build index tuple and axes_out in definition order ────────────────
+        # Output axis order always mirrors the sub-tensor storage order:
+        # (*param_dims, *outcome_dims).  select() subsets values; it never
+        # reorders.  Reordering is the responsibility of squeeze().
 
         full_idx: list[Any] = []
         axes_out: list[AxisDef] = []
@@ -1092,13 +1123,10 @@ class ExperimentSpace:
             else:
                 val = param_sel[pi]
                 if isinstance(val, list):
-                    idxs = [p.index_of(v) for v in val]
-                    full_idx.append(idxs)
-                    # Restricted AxisDef: same metadata, subset of values
+                    full_idx.append([p.index_of(v) for v in val])
                     axes_out.append(AxisDef(p.name, val, p.unit, p.scale))
                 else:
-                    full_idx.append(p.index_of(val))
-                    # scalar → axis collapsed, not added to axes_out
+                    full_idx.append(p.index_of(val))  # scalar → collapsed
 
         for oi, ax in enumerate(od.dim_axes):
             if oi not in outcome_sel:
@@ -1107,36 +1135,27 @@ class ExperimentSpace:
             else:
                 val = outcome_sel[oi]
                 if isinstance(val, list):
-                    idxs = [ax.index_of(v) for v in val]
-                    full_idx.append(idxs)
+                    full_idx.append([ax.index_of(v) for v in val])
                     axes_out.append(AxisDef(ax.name, val, ax.unit, ax.scale))
                 else:
-                    full_idx.append(ax.index_of(val))
-                    # scalar → collapsed
+                    full_idx.append(ax.index_of(val))  # scalar → collapsed
 
-        # numpy fancy indexing with mixed slice/int/list requires np.ix_
-        # for the list dimensions; we use a two-pass approach:
-        # first apply scalar/slice indices, then apply fancy indices.
+        # ── Apply index: two-pass for mixed scalar/slice/list indexing ────────
         result = t
 
-        # Pass 1: apply scalars and slices (preserves axis order)
-        scalar_idx = tuple(
-            (slice(None) if isinstance(i, list) else i) for i in full_idx
-        )
-        result = result[scalar_idx]
+        # Pass 1: scalars and slices (axis order preserved)
+        result = result[
+            tuple(slice(None) if isinstance(i, list) else i for i in full_idx)
+        ]
 
-        # Pass 2: apply list (fancy) indices.
-        # After pass 1, scalar axes are gone; rebuild position mapping.
+        # Pass 2: fancy (list) indices via np.ix_ to avoid shape broadcasting
         surviving = [i for i in full_idx if not isinstance(i, int)]
-        list_positions = [pos for pos, i in enumerate(surviving) if isinstance(i, list)]
-        if list_positions:
-            # Build np.ix_ grid over the list dimensions only
-            list_idx_values = [surviving[pos] for pos in list_positions]
-            # Construct full index: slice(None) for non-list dims, ix_ for list dims
-            grid = np.ix_(*list_idx_values)
+        list_pos = [p for p, i in enumerate(surviving) if isinstance(i, list)]
+        if list_pos:
+            grid = np.ix_(*[surviving[p] for p in list_pos])
             grid_idx = [slice(None)] * result.ndim
-            for pos, g in zip(list_positions, grid):
-                grid_idx[pos] = g
+            for p, g in zip(list_pos, grid):
+                grid_idx[p] = g
             result = result[tuple(grid_idx)]
 
         return SelectionResult(outcome=outcome, tensor=result, axes=axes_out)
