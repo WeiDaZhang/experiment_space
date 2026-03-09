@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 import warnings
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -370,6 +372,232 @@ class OutcomeDef:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SelectionResult  —  named container returned by ExperimentSpace.select()
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class SelectionResult:
+    """
+    Container for a sub-tensor returned by ExperimentSpace.select().
+
+    Bundles the numeric data with its full axis metadata so the two never
+    become separated when passed between functions or plotting code.
+
+    Attributes
+    ----------
+    outcome : str
+        Name of the OutcomeDef that produced this result.
+    tensor  : np.ndarray
+        The selected sub-tensor.  tensor.shape[i] corresponds to axes[i].
+    axes    : list[AxisDef]
+        One AxisDef per tensor dimension, in order.
+        Scalar-fixed axes are absent; list-restricted axes carry the subset
+        of values that was selected.
+
+    Axis access
+    -----------
+    result[name]          AxisDef by name (bare or "p:"/"o:" qualified).
+    result.dim(name)      Integer dimension index of a named axis.
+    result.coords(dim)    Coordinate values along a dimension (int or name).
+    result.labels(dim)    Display strings for coordinates along a dimension.
+    result.axis_label(dim)  Axis title string, e.g. "frequency (Hz)".
+
+    Plotting
+    --------
+    result.plot()         Auto-dispatch: line (1D), heatmap (2D), subplots (3D).
+                          Returns the matplotlib Figure.
+    """
+
+    outcome: str
+    tensor: np.ndarray
+    axes: list["AxisDef"]
+
+    # ── Shape ─────────────────────────────────────────────────────────────────
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.tensor.shape
+
+    @property
+    def ndim(self) -> int:
+        return self.tensor.ndim
+
+    # ── Axis access ───────────────────────────────────────────────────────────
+
+    def dim(self, name: str) -> int:
+        """
+        Return the dimension index of an axis by name.
+        Accepts bare names or "p:"/"o:" qualified names (prefix stripped).
+        """
+        bare = name[2:] if name.startswith(("p:", "o:")) else name
+        for i, ax in enumerate(self.axes):
+            if ax.name == bare:
+                return i
+        raise KeyError(
+            f"SelectionResult: no axis named '{bare}' in {[a.name for a in self.axes]}"
+        )
+
+    def __getitem__(self, name: str) -> "AxisDef":
+        """Return the AxisDef for the named axis."""
+        return self.axes[self.dim(name)]
+
+    def coords(self, dim: int) -> list:
+        """Coordinate values along dimension dim."""
+        return self.axes[dim].values
+
+    def labels(self, dim: int) -> list[str]:
+        """Display strings for coordinates along dimension dim."""
+        return self.axes[dim].labels
+
+    def axis_label(self, dim: int) -> str:
+        """Axis title string for dimension dim, e.g. 'frequency (Hz)'."""
+        return self.axes[dim].axis_label
+
+    # ── Plotting ──────────────────────────────────────────────────────────────
+
+    def plot(
+        self,
+        title: str | None = None,
+        figsize: tuple[float, float] | None = None,
+        cmap: str = "viridis",
+    ) -> "plt.Figure":
+        """
+        Auto-dispatch plot based on tensor dimensionality.
+
+        1-D  → line plot.
+        2-D  → heatmap (imshow).
+        3-D  → row of heatmaps, one per slice along axis 0.
+        >3-D → raises NotImplementedError; reduce with select() first.
+
+        Parameters
+        ----------
+        title   : overall figure title; defaults to the outcome name.
+        figsize : passed to plt.figure(); auto-sized if None.
+        cmap    : matplotlib colormap name for heatmaps.
+
+        Returns the matplotlib Figure.
+        """
+        ndim = self.tensor.ndim
+        if ndim == 0:
+            raise ValueError(
+                "SelectionResult.plot(): tensor is scalar (0-D). Nothing to plot."
+            )
+        if ndim > 3:
+            raise NotImplementedError(
+                f"SelectionResult.plot(): tensor is {ndim}-D. "
+                f"Reduce to ≤3-D with select() before plotting."
+            )
+
+        fig_title = title or self.outcome
+
+        if ndim == 1:
+            return self._plot_1d(fig_title, figsize)
+        elif ndim == 2:
+            return self._plot_2d(fig_title, figsize, cmap)
+        else:
+            return self._plot_3d(fig_title, figsize, cmap)
+
+    # ── Internal plot helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _apply_scale(ax_mpl, axis: "AxisDef", which: str) -> None:
+        """Apply log/linear scale and label to a matplotlib axis."""
+        set_scale = ax_mpl.set_xscale if which == "x" else ax_mpl.set_yscale
+        set_label = ax_mpl.set_xlabel if which == "x" else ax_mpl.set_ylabel
+        if axis.scale == "log":
+            set_scale("log")
+        set_label(axis.axis_label)
+
+    def _plot_1d(self, title: str, figsize) -> "plt.Figure":
+        ax_def = self.axes[0]
+        xs = ax_def.values
+        ys = self.tensor
+
+        fig, ax = plt.subplots(figsize=figsize or (7, 4))
+        ax.plot(xs, ys, marker="o", linewidth=1.5, markersize=4)
+        ax.set_xticks(xs)
+        ax.set_xticklabels(ax_def.labels, rotation=45, ha="right")
+        self._apply_scale(ax, ax_def, "x")
+        ax.set_ylabel(self.outcome)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        return fig
+
+    def _plot_2d(self, title: str, figsize, cmap: str) -> "plt.Figure":
+        row_def = self.axes[0]  # y axis
+        col_def = self.axes[1]  # x axis
+        data = self.tensor  # shape (n_rows, n_cols)
+
+        fig, ax = plt.subplots(figsize=figsize or (7, 5))
+        im = ax.imshow(
+            data,
+            aspect="auto",
+            origin="lower",
+            cmap=cmap,
+            interpolation="nearest",
+        )
+        fig.colorbar(im, ax=ax, label=self.outcome)
+
+        ax.set_xticks(range(len(col_def.values)))
+        ax.set_xticklabels(col_def.labels, rotation=45, ha="right")
+        ax.set_yticks(range(len(row_def.values)))
+        ax.set_yticklabels(row_def.labels)
+        ax.set_xlabel(col_def.axis_label)
+        ax.set_ylabel(row_def.axis_label)
+        ax.set_title(title)
+        fig.tight_layout()
+        return fig
+
+    def _plot_3d(self, title: str, figsize, cmap: str) -> "plt.Figure":
+        slice_def = self.axes[0]  # one panel per value on this axis
+        row_def = self.axes[1]
+        col_def = self.axes[2]
+        n_slices = len(slice_def.values)
+
+        fig, axes_mpl = plt.subplots(
+            1,
+            n_slices,
+            figsize=figsize or (4 * n_slices, 4),
+            squeeze=False,
+        )
+        vmin = np.nanmin(self.tensor)
+        vmax = np.nanmax(self.tensor)
+
+        for si, (val, ax) in enumerate(zip(slice_def.values, axes_mpl[0])):
+            im = ax.imshow(
+                self.tensor[si],
+                aspect="auto",
+                origin="lower",
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="nearest",
+            )
+            ax.set_xticks(range(len(col_def.values)))
+            ax.set_xticklabels(col_def.labels, rotation=45, ha="right")
+            ax.set_yticks(range(len(row_def.values)))
+            ax.set_yticklabels(row_def.labels if si == 0 else [])
+            ax.set_xlabel(col_def.axis_label)
+            if si == 0:
+                ax.set_ylabel(row_def.axis_label)
+            ax.set_title(f"{slice_def.axis_label} = {slice_def.label(val)}")
+
+        fig.colorbar(im, ax=axes_mpl[0, -1], label=self.outcome)
+        fig.suptitle(title, y=1.02)
+        fig.tight_layout()
+        return fig
+
+    def __repr__(self) -> str:
+        axes_str = ", ".join(f"{ax.axis_label}({ax.n})" for ax in self.axes)
+        return (
+            f"SelectionResult(outcome='{self.outcome}', "
+            f"shape={self.shape}, axes=[{axes_str}])"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ExperimentSpace
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -590,7 +818,7 @@ class ExperimentSpace:
         self,
         outcome: str,
         axes: dict[str, Any] | None = None,
-    ) -> tuple[np.ndarray, list[AxisDef]]:
+    ) -> SelectionResult:
         """
         Return a sub-tensor of one outcome, filtered and/or sliced by axis name.
 
@@ -650,7 +878,7 @@ class ExperimentSpace:
         if not axes:
             # Return full tensor; axes_out = all param axes + all outcome axes
             axes_out = list(self.parameters) + list(od.dim_axes)
-            return t, axes_out
+            return SelectionResult(outcome=outcome, tensor=t, axes=axes_out)
 
         param_sel, outcome_sel = self._resolve_axes(od, axes)
 
@@ -720,7 +948,7 @@ class ExperimentSpace:
                 grid_idx[pos] = g
             result = result[tuple(grid_idx)]
 
-        return result, axes_out
+        return SelectionResult(outcome=outcome, tensor=result, axes=axes_out)
 
     def slice_2d(
         self,
@@ -728,7 +956,7 @@ class ExperimentSpace:
         row: str,
         col: str,
         fixed: dict[str, Any] | None = None,
-    ) -> tuple[np.ndarray, AxisDef, AxisDef]:
+    ) -> SelectionResult:
         """
         Convenience wrapper around select() for the common 2-D heatmap case.
 
@@ -756,7 +984,8 @@ class ExperimentSpace:
             axes_dict.update(fixed)  # scalar → will be collapsed
 
         # Call select with only the fixed axes; row and col remain free
-        t, axes_out = self.select(outcome, axes_dict if axes_dict else None)
+        sel = self.select(outcome, axes_dict if axes_dict else None)
+        t, axes_out = sel.tensor, sel.axes
 
         # Find row and col positions in axes_out
         def _find(name: str) -> int:
@@ -794,7 +1023,11 @@ class ExperimentSpace:
         if new_ri > new_ci:
             mat = mat.T
 
-        return mat, axes_out[ri], axes_out[ci]
+        return SelectionResult(
+            outcome=outcome,
+            tensor=mat,
+            axes=[axes_out[ri], axes_out[ci]],
+        )
 
     # ── Introspection ─────────────────────────────────────────────────────────
 
@@ -1064,7 +1297,7 @@ if __name__ == "__main__":
     # ── select() — name-based, unified parameter + outcome axes ─────────────
 
     print("\n── select: fix params (scalar), restrict freq (list) ──")
-    t1, ax1 = space.select(
+    r1 = space.select(
         "spectrum",
         axes={
             "mode": "low",  # scalar → axis collapsed
@@ -1075,12 +1308,14 @@ if __name__ == "__main__":
             "o:frequency": [10, 50, 100],  # outcome freq bins — list → kept
         },
     )
-    print(f"   shape: {t1.shape}")
-    print(f"   axes : {[a.axis_label for a in ax1]}")
+    print(f"   {r1!r}")
+    print(f"   dim('thickness') = {r1.dim('thickness')}")
+    print(f"   coords(1)        = {r1.coords(1)}")
+    print(f"   labels(1)        = {r1.labels(1)}")
     # → (thickness, frequency[outcome=3]) remaining
 
     print("\n── select: restrict both a param and outcome axis ──")
-    t2, ax2 = space.select(
+    r2 = space.select(
         "spectrum",
         axes={
             "thickness": [1, 5],  # list → kept, 2 thicknesses
@@ -1092,31 +1327,28 @@ if __name__ == "__main__":
             "o:frequency": [10, 50, 100],  # list → kept, 3 freq bins
         },
     )
-    print(f"   shape : {t2.shape}")
-    print(f"   axes  : {[a.axis_label for a in ax2]}")
-    print(f"   thickness labels : {ax2[0].labels}")
-    print(f"   freq bin labels  : {ax2[-1].labels}")
+    print(f"   {r2!r}")
+    print(f"   r2['thickness'].labels = {r2['thickness'].labels}")
+    print(f"   r2['frequency'].labels = {r2['frequency'].labels}")
 
     print("\n── select: scalar collapse on outcome axis ──────────")
-    t3, ax3 = space.select(
+    r3 = space.select(
         "feature_stats",
         axes={
             "feature": "feat_2",  # outcome dim_axis — scalar → collapsed
             "statistic": "std",  # outcome dim_axis — scalar → collapsed
         },
     )
-    print(f"   shape: {t3.shape}  (pure param tensor, both outcome axes gone)")
-    print(f"   axes : {[a.axis_label for a in ax3]}")
+    print(f"   {r3!r}")
 
     print("\n── select: list on outcome axis, keep axis ──────────")
-    t4, ax4 = space.select(
+    r4 = space.select(
         "feature_stats",
         axes={
             "statistic": ["mean", "std"],  # list → kept
         },
     )
-    print(f"   shape: {t4.shape}")
-    print(f"   axes : {[a.axis_label for a in ax4]}")
+    print(f"   {r4!r}")
 
     print("\n── select: ambiguous name → qualify with p: / o: ───")
     # "frequency" exists as both a parameter and spectrum's dim_axis
@@ -1125,7 +1357,7 @@ if __name__ == "__main__":
     except ValueError as e:
         print(f"   ambiguous: {e}")
 
-    t5, ax5 = space.select(
+    r5 = space.select(
         "spectrum",
         axes={
             "p:frequency": [10, 100],  # the parameter axis
@@ -1136,26 +1368,26 @@ if __name__ == "__main__":
             "sample_rate": 1000,
         },
     )
-    print(f"   qualified shape: {t5.shape}")
-    print(f"   axes: {[a.axis_label for a in ax5]}")
+    print(f"   {r5!r}")
 
     # ── slice_2d — now uses axis names for row/col ────────────────────────────
 
     print("\n── slice_2d: grand_mean, thickness × frequency ──────")
-    mat, row_ax, col_ax = space.slice_2d(
+    s1 = space.slice_2d(
         outcome="grand_mean",
         row="thickness",
         col="frequency",
         fixed={"mode": "low", "temperature": 20, "material": "A", "sample_rate": 1000},
     )
-    print(f"   {row_ax.axis_label}: {row_ax.labels}")
-    print(f"   {col_ax.axis_label}: {col_ax.labels}")
-    print(f"   matrix:\n   {np.round(mat, 4)}")
+    print(f"   {s1!r}")
+    print(f"   {s1.axis_label(0)}: {s1.labels(0)}")
+    print(f"   {s1.axis_label(1)}: {s1.labels(1)}")
+    print(f"   matrix:\n   {np.round(s1.tensor, 4)}")
 
     print("\n── slice_2d: spectrum, thickness × freq bin ─────────")
     # Row = thickness (param), col = frequency (outcome dim_axis)
     # "frequency" is ambiguous — qualify
-    mat2, row_ax2, col_ax2 = space.slice_2d(
+    s2 = space.slice_2d(
         outcome="spectrum",
         row="thickness",
         col="o:frequency",  # outcome dim_axis, not param
@@ -1167,9 +1399,8 @@ if __name__ == "__main__":
             "sample_rate": 1000,
         },
     )
-    print(f"   {row_ax2.axis_label}: {row_ax2.labels}")
-    print(f"   {col_ax2.axis_label}: {col_ax2.labels[:5]}...")
-    print(f"   matrix (first 5 freq bins):\n   {np.round(mat2[:, :5], 4)}")
+    print(f"   {s2!r}")
+    print(f"   matrix (first 5 cols):\n   {np.round(s2.tensor[:, :5], 4)}")
 
     # ── index_of with annotated strings ──────────────────────────────────────
 
@@ -1224,6 +1455,67 @@ if __name__ == "__main__":
         mode_p.index_of("1low")
     except KeyError as e:
         print(f"   no-unit axis:  {e}")
+
+    # ── SelectionResult.plot() ───────────────────────────────────────────────
+
+    print("\n── plot() demonstrations ────────────────────────")
+
+    # 1-D: feature_means for a single cell — all features along one run
+    r_1d = space.select(
+        "feature_means",
+        axes={
+            "thickness": 2,
+            "p:frequency": 10,
+            "mode": "mid",
+            "temperature": 37,
+            "material": "B",
+            "sample_rate": 2000,
+        },
+    )
+    print(f"   1-D: {r_1d!r}")
+    fig1 = r_1d.plot(title="Feature means — 2mm/10Hz/mid")
+    plt.show()
+    # fig1.savefig("/mnt/user-data/outputs/plot_1d.png", dpi=120, bbox_inches="tight")
+    print("   saved plot_1d.png")
+
+    # 2-D: spectrum outcome, thickness × frequency bins (restricted)
+    r_2d = space.select(
+        "spectrum",
+        axes={
+            "p:frequency": 10,
+            "mode": "low",
+            "temperature": 20,
+            "material": "A",
+            "sample_rate": 1000,
+            "o:frequency": FREQ_BINS[:20],  # first 20 freq bins
+        },
+    )
+    print(f"   2-D: {r_2d!r}")
+    fig2 = r_2d.plot(title="Spectrum — thickness × frequency bins")
+    plt.show()
+    # fig2.savefig("/mnt/user-data/outputs/plot_2d.png", dpi=120, bbox_inches="tight")
+    print("   saved plot_2d.png")
+
+    # 3-D: feature_stats — thickness × feature × statistic, fix remaining params
+    r_3d = space.select(
+        "feature_stats",
+        axes={
+            "thickness": [1, 2, 5],  # list → kept (slices)
+            "p:frequency": 10,
+            "mode": "low",
+            "temperature": 20,
+            "material": "A",
+            "sample_rate": 1000,
+            # keep both outcome axes: feature(4) and statistic(2)
+        },
+    )
+    print(f"   3-D: {r_3d!r}")
+    fig3 = r_3d.plot(title="Feature stats — thickness × feature × statistic")
+    plt.show()
+    # fig3.savefig("/mnt/user-data/outputs/plot_3d.png", dpi=120, bbox_inches="tight")
+    print("   saved plot_3d.png")
+
+    plt.close("all")
 
     # ── add_outcome on the fly ────────────────────────────────────────────────
 
