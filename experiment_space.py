@@ -1,263 +1,336 @@
 """
-6-D Parameter Tensor with Matrix Outcomes & Derivatives
-========================================================
+Generalised N-Dimensional Parameter Tensor
+===========================================
+
+Parameters and outcomes are defined as dataclasses.
+The tensor dimension is fully inferred from the parameter definitions —
+no hardcoded 6 anywhere.
 
 Structure
 ---------
-Each cell (p1..p6) stores:
-  - raw outcome  : (N+1) x f  ndarray   (e.g. time/freq × features)
-  - derived      : dict[str, scalar | ndarray]  computed from the raw matrix
-
-Storage
--------
-  raw_store  : dict  {param_tuple -> (N+1)xf ndarray}   sparse, only logged cells
-  deriv_T    : ndarray  shape (*param_dims, n_derived)    dense, NaN for unrun cells
-
-The derived tensor is cheap to store densely and supports the visualisation /
-ranking / slicing from before. Raw matrices are accessed on demand.
+  ParameterDef  : one axis of the tensor (name + discrete values)
+  OutcomeDef    : one derivative function applied to the raw matrix
+  ExperimentSpace : owns the tensor, raw store, and all operations
 """
 
+from __future__ import annotations
+
 import numpy as np
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
-# ── 1. Parameter space (edit these) ─────────────────────────────────────────
 
-PARAMS = {
-    "Alpha": [0.1, 0.5, 1.0],
-    "Beta": [10, 50, 100],
-    "Gamma": ["low", "mid", "high"],
-    "Delta": [0.01, 0.1],
-    "Eps": ["A", "B", "C"],
-    "Zeta": [1, 2, 4, 8],
-}
-
-# Raw outcome shape
-N = 99  # so the matrix is (N+1) rows  e.g. 100 time steps
-F = 4  # number of features / channels
-
-# ── 2. Derivative definitions ────────────────────────────────────────────────
-#
-# Each entry: (name, function(matrix) -> scalar or 1-D array)
-# The function receives the (N+1)×f matrix and must return a fixed-size result.
-#
-# Mixed scalars and vectors are fine — they are stored flattened into one row
-# of deriv_T; DERIVATIVE_SLICES records which positions belong to which name.
+# ── Dataclasses ──────────────────────────────────────────────────────────────
 
 
-def _col_means(m):
-    return m.mean(axis=0)  # shape (f,)   — mean of each feature
+@dataclass
+class ParameterDef:
+    """One parameter axis in the experiment space."""
+
+    name: str
+    values: list[Any]  # discrete values this param can take
+
+    # Derived at post-init — not set by user
+    _index_map: dict[Any, int] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self):
+        self._index_map = {v: i for i, v in enumerate(self.values)}
+
+    @property
+    def n(self) -> int:
+        return len(self.values)
+
+    def index_of(self, value: Any) -> int:
+        if value not in self._index_map:
+            raise KeyError(
+                f"Parameter '{self.name}': value {value!r} not in {self.values}"
+            )
+        return self._index_map[value]
 
 
-def _col_maxs(m):
-    return m.max(axis=0)  # shape (f,)   — max  of each feature
-
-
-def _col_stds(m):
-    return m.std(axis=0)  # shape (f,)   — std  of each feature
-
-
-def _overall_mean(m):
-    return np.array([m.mean()])  # shape (1,)   — grand mean
-
-
-def _peak_row(m):
-    return np.array([m.sum(axis=1).argmax() / len(m)])  # normalised peak index
-
-
-def _slope(m):  # shape (f,)   — linear trend per feature
-    x = np.arange(len(m))
-    x = (x - x.mean()) / (x.std() + 1e-12)
-    return np.array([np.polyfit(x, m[:, j], 1)[0] for j in range(m.shape[1])])
-
-
-DERIVATIVES: list[tuple[str, Callable]] = [
-    ("col_means", _col_means),
-    ("col_maxs", _col_maxs),
-    ("col_stds", _col_stds),
-    ("overall_mean", _overall_mean),
-    ("peak_row", _peak_row),
-    ("slope", _slope),
-]
-
-# ── 3. Internal indexing ─────────────────────────────────────────────────────
-
-param_names = list(PARAMS.keys())
-param_values = list(PARAMS.values())
-param_dims = [len(v) for v in param_values]
-
-index_maps = [{v: i for i, v in enumerate(vals)} for vals in param_values]
-
-
-def _param_idx(param_dict: dict) -> tuple:
-    return tuple(index_maps[i][param_dict[name]] for i, name in enumerate(param_names))
-
-
-# Work out flat layout of the derived vector
-_deriv_sizes: list[int] = []
-_test_mat = np.ones((N + 1, F))
-for _name, _fn in DERIVATIVES:
-    _out = np.atleast_1d(_fn(_test_mat))
-    _deriv_sizes.append(_out.size)
-
-DERIVATIVE_SLICES: dict[str, slice] = {}
-_pos = 0
-for (_name, _), _sz in zip(DERIVATIVES, _deriv_sizes):
-    DERIVATIVE_SLICES[_name] = slice(_pos, _pos + _sz)
-    _pos += _sz
-
-n_derived = _pos
-
-# Dense derived tensor: shape (*param_dims, n_derived)
-deriv_T = np.full((*param_dims, n_derived), np.nan)
-
-# Sparse raw store: param_tuple -> (N+1) x f ndarray
-raw_store: dict[tuple, np.ndarray] = {}
-
-print(f"Parameter dims   : {param_dims}  ({np.prod(param_dims)} cells)")
-print(f"Raw matrix shape : ({N + 1}, {F})")
-print(f"Derived vector   : {n_derived} values from {len(DERIVATIVES)} functions")
-for name, sl in DERIVATIVE_SLICES.items():
-    print(f"  [{sl.start}:{sl.stop}]  {name}")
-print(f"deriv_T shape    : {deriv_T.shape}\n")
-
-
-# ── 4. Log a run ─────────────────────────────────────────────────────────────
-
-
-def log_run(param_dict: dict[str, Any], matrix: np.ndarray) -> dict[str, np.ndarray]:
+@dataclass
+class OutcomeDef:
     """
-    Store a raw (N+1)×f matrix for one parameter combination and compute
-    all derivatives automatically.
+    One derived outcome computed from the raw (N+1)×f matrix.
 
-    Returns the dict of computed derivatives for inspection.
+    fn        : (N+1)×f ndarray  ->  scalar or 1-D ndarray (fixed size)
+    direction : 'max' | 'min' | None  — used for scoring / ranking
     """
-    assert matrix.shape == (N + 1, F), f"Expected ({N + 1}, {F}), got {matrix.shape}"
 
-    idx = _param_idx(param_dict)
+    name: str
+    fn: Callable[[np.ndarray], np.ndarray | float]
+    direction: str | None = "max"  # 'max', 'min', or None (informational)
+    _size: int = field(default=0, init=False, repr=False)
 
-    # Store raw
-    raw_store[idx] = matrix.copy()
-
-    # Compute and store derived values
-    derived_vec = np.empty(n_derived)
-    results = {}
-    for name, fn in DERIVATIVES:
-        val = np.atleast_1d(fn(matrix))
-        derived_vec[DERIVATIVE_SLICES[name]] = val
-        results[name] = val
-
-    deriv_T[idx] = derived_vec
-    return results
+    def compute(self, matrix: np.ndarray) -> np.ndarray:
+        return np.atleast_1d(np.asarray(self.fn(matrix), dtype=float))
 
 
-# ── 5. Retrieve ───────────────────────────────────────────────────────────────
+@dataclass
+class RawShape:
+    """Shape of the raw outcome matrix stored at each cell."""
+
+    rows: int  # N+1
+    cols: int  # f
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.rows, self.cols)
 
 
-def get_raw(param_dict: dict) -> np.ndarray | None:
-    """Return the raw (N+1)×f matrix, or None if not yet run."""
-    return raw_store.get(_param_idx(param_dict))
+# ── Experiment Space ─────────────────────────────────────────────────────────
 
 
-def get_derived(param_dict: dict) -> dict[str, np.ndarray] | None:
-    """Return a dict of all derived quantities, or None if not yet run."""
-    idx = _param_idx(param_dict)
-    row = deriv_T[idx]
-    if np.all(np.isnan(row)):
-        return None
-    return {name: row[sl] for name, sl in DERIVATIVE_SLICES.items()}
-
-
-def get_derived_scalar(name: str) -> np.ndarray:
+class ExperimentSpace:
     """
-    Return a sub-tensor of shape (*param_dims, size_of_derivative).
-    NaN where the cell has not been run.
-    Useful for heatmaps and slicing.
+    An n-dimensional sparse tensor over a discrete parameter grid.
+
+    Each cell may hold:
+      - a raw (rows × cols) matrix
+      - a flat vector of derived values (concatenation of all OutcomeDef outputs)
+
+    Parameters
+    ----------
+    parameters : list of ParameterDef   — defines the tensor axes
+    outcomes   : list of OutcomeDef     — defines what to compute from each raw matrix
+    raw_shape  : RawShape               — shape of the raw outcome matrix
     """
-    return deriv_T[..., DERIVATIVE_SLICES[name]]
 
+    def __init__(
+        self,
+        parameters: list[ParameterDef],
+        outcomes: list[OutcomeDef],
+        raw_shape: RawShape,
+    ):
+        self.parameters = parameters
+        self.outcomes = outcomes
+        self.raw_shape = raw_shape
 
-# ── 6. Add a new derivative after the fact ───────────────────────────────────
+        self._param_dims: list[int] = [p.n for p in parameters]
+        self._n_dims: int = len(parameters)
+        self._raw_store: dict[tuple, np.ndarray] = {}
+        self._slices: dict[str, slice] = {}
+        self._deriv_size: int = 0
 
+        self._build_slices()
 
-def add_derivative(name: str, fn: Callable) -> None:
-    """
-    Compute a new derivative for all already-logged runs and append it to
-    deriv_T.  Use this when your criteria evolve and you want a new metric.
-    """
-    global deriv_T, n_derived
+        # Dense derived tensor — shape (*param_dims, n_derived), NaN = unrun
+        self.deriv_T = np.full((*self._param_dims, self._deriv_size), np.nan)
 
-    # Determine output size from first logged run
-    sample = next(iter(raw_store.values()))
-    sz = np.atleast_1d(fn(sample)).size
+    # ── Internal helpers ─────────────────────────────────────────────────────
 
-    # Extend the tensor
-    extra = np.full((*param_dims, sz), np.nan)
-    deriv_T = np.concatenate([deriv_T, extra], axis=-1)
+    def _build_slices(self) -> None:
+        """Compute flat layout of the derived vector from a probe matrix."""
+        probe = np.ones(self.raw_shape.shape)
+        pos = 0
+        for od in self.outcomes:
+            out = od.compute(probe)
+            od._size = out.size
+            self._slices[od.name] = slice(pos, pos + od._size)
+            pos += od._size
+        self._deriv_size = pos
 
-    new_sl = slice(n_derived, n_derived + sz)
-    DERIVATIVE_SLICES[name] = new_sl
-    DERIVATIVES.append((name, fn))
-    n_derived += sz
+    def _param_idx(self, param_dict: dict[str, Any]) -> tuple[int, ...]:
+        return tuple(p.index_of(param_dict[p.name]) for p in self.parameters)
 
-    # Back-fill for all existing runs
-    for idx, mat in raw_store.items():
-        deriv_T[idx + (new_sl,)] = np.atleast_1d(fn(mat))
+    def _full_idx(self, param_dict: dict[str, Any]) -> tuple:
+        """Index into deriv_T: (*param_idx, slice-all-derived)."""
+        return self._param_idx(param_dict)
 
-    print(
-        f"Added derivative '{name}'  [{new_sl.start}:{new_sl.stop}]  "
-        f"→ deriv_T now shape {deriv_T.shape}"
-    )
+    # ── Public API ───────────────────────────────────────────────────────────
 
+    def log_run(
+        self,
+        param_dict: dict[str, Any],
+        matrix: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """
+        Store a raw matrix and compute all derivatives for one parameter combination.
 
-# ── 7. 2-D slice of a derived scalar ─────────────────────────────────────────
+        Returns a dict {outcome_name: computed_array} for immediate inspection.
+        """
+        if matrix.shape != self.raw_shape.shape:
+            raise ValueError(
+                f"Expected matrix shape {self.raw_shape.shape}, got {matrix.shape}"
+            )
+        idx = self._param_idx(param_dict)
+        self._raw_store[idx] = matrix.copy()
 
+        results: dict[str, np.ndarray] = {}
+        for od in self.outcomes:
+            val = od.compute(matrix)
+            self.deriv_T[idx][self._slices[od.name]] = val
+            results[od.name] = val
+        return results
 
-def slice_2d(
-    fixed: dict[str, Any],
-    row_param: str,
-    col_param: str,
-    deriv_name: str,
-    deriv_component: int = 0,
-) -> np.ndarray:
-    """
-    Fix 4 parameters, vary 2, return a 2-D matrix of one derived scalar.
-    If the derivative is a vector (e.g. col_means has f components),
-    use deriv_component to pick which one.
-    """
-    sl = DERIVATIVE_SLICES[deriv_name]
-    sub = get_derived_scalar(deriv_name)  # shape (*param_dims, sz)
-    if sub.shape[-1] > 1:
-        sub = sub[..., deriv_component]  # shape (*param_dims,)
-    else:
-        sub = sub[..., 0]
+    def get_raw(self, param_dict: dict[str, Any]) -> np.ndarray | None:
+        """Return the raw matrix for a cell, or None if unrun."""
+        return self._raw_store.get(self._param_idx(param_dict))
 
-    idx = []
-    for name in param_names:
-        if name in (row_param, col_param):
-            idx.append(slice(None))
+    def get_derived(self, param_dict: dict[str, Any]) -> dict[str, np.ndarray] | None:
+        """Return all derived quantities for a cell, or None if unrun."""
+        idx = self._param_idx(param_dict)
+        row = self.deriv_T[idx]
+        if np.all(np.isnan(row)):
+            return None
+        return {od.name: row[self._slices[od.name]] for od in self.outcomes}
+
+    def get_outcome_tensor(self, outcome_name: str) -> np.ndarray:
+        """
+        Return a sub-tensor of shape (*param_dims, outcome_size).
+        NaN where the cell is unrun. Useful for heatmaps and slicing.
+        """
+        sl = self._slices[outcome_name]
+        return self.deriv_T[..., sl]
+
+    def add_outcome(self, outcome_def: OutcomeDef) -> None:
+        """
+        Append a new OutcomeDef and back-fill it for all already-logged runs.
+        Use this as your criteria evolve — no re-running needed.
+        """
+        probe = np.ones(self.raw_shape.shape)
+        val = outcome_def.compute(probe)
+        outcome_def._size = val.size
+
+        new_sl = slice(self._deriv_size, self._deriv_size + outcome_def._size)
+        self._slices[outcome_def.name] = new_sl
+        self.outcomes.append(outcome_def)
+        self._deriv_size += outcome_def._size
+
+        # Extend deriv_T along the last axis
+        extra = np.full((*self._param_dims, outcome_def._size), np.nan)
+        self.deriv_T = np.concatenate([self.deriv_T, extra], axis=-1)
+
+        # Back-fill existing runs
+        for idx, mat in self._raw_store.items():
+            self.deriv_T[idx + (new_sl,)] = outcome_def.compute(mat)
+
+        print(
+            f"Added outcome '{outcome_def.name}'  "
+            f"[{new_sl.start}:{new_sl.stop}]  "
+            f"→ deriv_T shape {self.deriv_T.shape}"
+        )
+
+    def slice_2d(
+        self,
+        fixed: dict[str, Any],
+        row_param: str,
+        col_param: str,
+        outcome: str,
+        component: int = 0,
+    ) -> tuple[np.ndarray, list, list]:
+        """
+        Fix all but two parameters, return a 2-D matrix of one derived scalar.
+
+        If the outcome is a vector (e.g. col_means with f components),
+        `component` selects which element to show.
+
+        Returns (matrix, row_values, col_values) for labelled plotting.
+        """
+        sub = self.get_outcome_tensor(outcome)  # (*param_dims, size)
+        if sub.shape[-1] > 1:
+            sub = sub[..., component]
         else:
-            idx.append(index_maps[param_names.index(name)][fixed[name]])
+            sub = sub[..., 0]
 
-    mat = sub[tuple(idx)]
-    if param_names.index(row_param) > param_names.index(col_param):
-        mat = mat.T
-    return mat
+        param_name_list = [p.name for p in self.parameters]
+        row_axis = param_name_list.index(row_param)
+        col_axis = param_name_list.index(col_param)
+
+        idx: list[Any] = []
+        for p in self.parameters:
+            if p.name in (row_param, col_param):
+                idx.append(slice(None))
+            else:
+                idx.append(p.index_of(fixed[p.name]))
+
+        mat = sub[tuple(idx)]
+        if row_axis > col_axis:
+            mat = mat.T
+
+        row_vals = self.parameters[row_axis].values
+        col_vals = self.parameters[col_axis].values
+        return mat, row_vals, col_vals
+
+    def sparsity(self) -> dict[str, Any]:
+        n_total = int(np.prod(self._param_dims))
+        n_run = int((~np.all(np.isnan(self.deriv_T), axis=-1)).sum())
+        return {
+            "n_cells": n_total,
+            "n_run": n_run,
+            "n_unrun": n_total - n_run,
+            "coverage": n_run / n_total,
+            "param_dims": self._param_dims,
+            "n_params": self._n_dims,
+            "deriv_T_shape": self.deriv_T.shape,
+        }
+
+    def __repr__(self) -> str:
+        s = self.sparsity()
+        params_str = " × ".join(f"{p.name}({p.n})" for p in self.parameters)
+        return (
+            f"ExperimentSpace[\n"
+            f"  params  : {params_str}\n"
+            f"  dims    : {s['param_dims']}  →  {s['n_cells']} cells\n"
+            f"  raw     : {self.raw_shape.shape}  per cell\n"
+            f"  derived : {self._deriv_size} values  {list(self._slices.keys())}\n"
+            f"  run     : {s['n_run']} / {s['n_cells']}  "
+            f"({100 * s['coverage']:.1f}% coverage)\n]"
+        )
 
 
-# ── 8. Sparsity ───────────────────────────────────────────────────────────────
-
-
-def sparsity_report() -> None:
-    n_total = np.prod(param_dims)
-    run_mask = ~np.all(np.isnan(deriv_T), axis=-1)
-    n_run = int(run_mask.sum())
-    print(f"Cells run : {n_run} / {n_total}  ({100 * n_run / n_total:.1f}% coverage)")
-
-
-# ── 9. Demo ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Demo — edit everything below to match your actual experiment
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    rng = np.random.default_rng(42)
+    # ── Define the parameter space ───────────────────────────────────────────
+
+    parameters = [
+        ParameterDef("Alpha", [0.1, 0.5, 1.0]),
+        ParameterDef("Beta", [10, 50, 100]),
+        ParameterDef("Gamma", ["low", "mid", "high"]),
+        ParameterDef("Delta", [0.01, 0.1]),
+        ParameterDef("Eps", ["A", "B", "C"]),
+        ParameterDef("Zeta", [1, 2, 4, 8]),
+    ]
+
+    # ── Define the raw matrix shape ──────────────────────────────────────────
+
+    raw_shape = RawShape(rows=100, cols=4)  # (N+1) x f
+
+    # ── Define initial outcomes (derivatives of the raw matrix) ─────────────
+
+    outcomes = [
+        OutcomeDef("col_means", lambda m: m.mean(axis=0), direction="max"),
+        OutcomeDef("col_maxs", lambda m: m.max(axis=0), direction="max"),
+        OutcomeDef("col_stds", lambda m: m.std(axis=0), direction=None),
+        OutcomeDef("overall_mean", lambda m: np.array([m.mean()]), direction="max"),
+        OutcomeDef(
+            "peak_row",
+            lambda m: np.array([m.sum(axis=1).argmax() / len(m)]),
+            direction=None,
+        ),
+        OutcomeDef(
+            "slope",
+            lambda m: np.array(
+                [
+                    np.polyfit((np.arange(len(m)) - len(m) / 2) / len(m), m[:, j], 1)[0]
+                    for j in range(m.shape[1])
+                ]
+            ),
+            direction=None,
+        ),
+    ]
+
+    # ── Build the space ──────────────────────────────────────────────────────
+
+    space = ExperimentSpace(parameters, outcomes, raw_shape)
+    print(space)
+
+    # ── Log some runs ────────────────────────────────────────────────────────
+
+    rng = np.random.default_rng(0)
 
     demo_runs = [
         {
@@ -287,47 +360,59 @@ if __name__ == "__main__":
         },
     ]
 
+    print("\n── Logging runs ────────────────────────────────")
     for p in demo_runs:
-        # Simulate a (N+1)×F matrix — replace with your real data
-        mat = (
-            rng.random((N + 1, F)) * p["Alpha"] + rng.standard_normal((N + 1, F)) * 0.05
-        )
-        derivs = log_run(p, mat)
+        mat = rng.random(raw_shape.shape) * p["Alpha"]
+        derivs = space.log_run(p, mat)
         print(
-            f"Logged {p['Alpha']}/{p['Beta']}/{p['Gamma']}  "
-            f"| overall_mean={derivs['overall_mean'][0]:.4f}  "
-            f"| col_means={np.round(derivs['col_means'], 3)}"
+            f"  {p['Alpha']}/{p['Beta']}/{p['Gamma']}"
+            f"  overall_mean={derivs['overall_mean'][0]:.4f}"
+            f"  col_means={np.round(derivs['col_means'], 3)}"
         )
 
-    print()
-    sparsity_report()
+    print(f"\n{space}")
 
-    # Retrieve raw matrix
-    raw = get_raw(
-        {"Alpha": 0.5, "Beta": 10, "Gamma": "mid", "Delta": 0.1, "Eps": "B", "Zeta": 2}
-    )
-    print(f"\nRaw matrix shape : {raw.shape}")
+    # ── Retrieve ─────────────────────────────────────────────────────────────
 
-    # Retrieve derived dict
-    d = get_derived(
-        {"Alpha": 0.5, "Beta": 10, "Gamma": "mid", "Delta": 0.1, "Eps": "B", "Zeta": 2}
-    )
-    print(f"Derived keys     : {list(d.keys())}")
-    print(f"slope            : {np.round(d['slope'], 4)}")
+    query = {
+        "Alpha": 0.5,
+        "Beta": 10,
+        "Gamma": "mid",
+        "Delta": 0.1,
+        "Eps": "B",
+        "Zeta": 2,
+    }
 
-    # 2-D slice
-    mat2d = slice_2d(
-        fixed={"Gamma": "mid", "Delta": 0.01, "Eps": "A", "Zeta": 1},
+    raw = space.get_raw(query)
+    print(f"\n── Raw matrix : {raw.shape}")
+
+    d = space.get_derived(query)
+    print(f"── Derived    : {list(d.keys())}")
+    print(f"   slope      : {np.round(d['slope'], 4)}")
+
+    # ── 2-D slice ────────────────────────────────────────────────────────────
+
+    mat2d, rows, cols = space.slice_2d(
+        fixed={"Gamma": "low", "Delta": 0.01, "Eps": "A", "Zeta": 1},
         row_param="Alpha",
         col_param="Beta",
-        deriv_name="overall_mean",
+        outcome="overall_mean",
     )
-    print(f"\noverall_mean slice (Alpha × Beta):\n{mat2d}")
+    print(f"\n── overall_mean slice  (Alpha × Beta)")
+    print(f"   rows={rows}  cols={cols}")
+    print(f"   {mat2d}")
 
-    # Add a new derivative on the fly (criteria evolve!)
-    print()
-    add_derivative("energy", lambda m: np.array([(m**2).sum()]))
-    d2 = get_derived(
-        {"Alpha": 0.5, "Beta": 10, "Gamma": "mid", "Delta": 0.1, "Eps": "B", "Zeta": 2}
+    # ── Add a new outcome on the fly ─────────────────────────────────────────
+
+    print("\n── Adding new outcome 'energy' ─────────────────")
+    space.add_outcome(
+        OutcomeDef(
+            name="energy",
+            fn=lambda m: np.array([(m**2).sum()]),
+            direction="min",
+        )
     )
-    print(f"energy           : {d2['energy'][0]:.2f}")
+
+    d2 = space.get_derived(query)
+    print(f"   energy = {d2['energy'][0]:.4f}")
+    print(f"\n{space}")
