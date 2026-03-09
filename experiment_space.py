@@ -304,6 +304,7 @@ class OutcomeDef:
 
     # Inferred on first compute() call — not set by user
     _out_shape: tuple[int, ...] = field(default=(), init=False, repr=False)
+    _out_dtype: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.direction not in ("max", "min", None):
@@ -318,7 +319,7 @@ class OutcomeDef:
         Apply fn to raw data.  Returns a numpy array; shape () for scalars.
         On the first call, validates dim_axes against the actual output shape.
         """
-        result = np.asarray(self.fn(raw), dtype=float)
+        result = np.asarray(self.fn(raw))
 
         if self._out_shape == ():  # first call only
             if result.shape != ():  # non-scalar: validate
@@ -335,6 +336,7 @@ class OutcomeDef:
                             f"('{ax.name}') has size {size} but AxisDef has n={ax.n}"
                         )
             object.__setattr__(self, "_out_shape", result.shape)
+            object.__setattr__(self, "_out_dtype", result.dtype)
 
         return result
 
@@ -342,6 +344,11 @@ class OutcomeDef:
     def out_shape(self) -> tuple[int, ...]:
         """Output array shape.  Available after the first compute() call."""
         return self._out_shape
+
+    @property
+    def out_dtype(self) -> "np.dtype | None":
+        """Output array dtype.  Available after the first compute() call."""
+        return self._out_dtype
 
     @property
     def is_scalar(self) -> bool:
@@ -827,7 +834,13 @@ class ExperimentSpace:
     def _ensure_sub_tensor(self, od: OutcomeDef) -> None:
         if od.name not in self._sub_tensors:
             shape = self._param_dims + od.out_shape
-            self._sub_tensors[od.name] = np.full(shape, np.nan)
+            dtype = od.out_dtype if od.out_dtype is not None else float
+            nan_val = (
+                complex(np.nan, np.nan)
+                if np.issubdtype(dtype, np.complexfloating)
+                else np.nan
+            )
+            self._sub_tensors[od.name] = np.full(shape, nan_val, dtype=dtype)
 
     def _write_cell(self, od: OutcomeDef, idx: tuple, value: np.ndarray) -> None:
         self._ensure_sub_tensor(od)
@@ -1745,6 +1758,29 @@ if __name__ == "__main__":
     print("   saved plot_3d.png")
 
     plt.close("all")
+
+    # ── complex dtype ────────────────────────────────────────────────────────
+
+    print("\n── complex dtype ────────────────────────────────")
+
+    space.add_outcome(
+        OutcomeDef(
+            name="fft_complex",
+            fn=lambda raw: np.fft.rfft(raw["timeseries"][:, 0]),
+            direction=None,
+            dim_axes=[FREQ_AXIS],
+        )
+    )
+
+    d_cx = space.get_derived(query)
+    cx = d_cx["fft_complex"]
+    print(f"   dtype  : {cx.dtype}")
+    print(f"   shape  : {cx.shape}")
+    print(f"   val[:3]: {np.round(cx[:3], 2)}")
+    print(f"   sub-tensor dtype: {space._sub_tensors['fft_complex'].dtype}")
+
+    # Real and complex outcomes coexist — check real outcome unaffected
+    print(f"   grand_mean dtype: {space._sub_tensors['grand_mean'].dtype}")
 
     # ── add_outcome on the fly ────────────────────────────────────────────────
 
