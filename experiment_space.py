@@ -1140,23 +1140,24 @@ class ExperimentSpace:
                 else:
                     full_idx.append(ax.index_of(val))  # scalar → collapsed
 
-        # ── Apply index: two-pass for mixed scalar/slice/list indexing ────────
+        # ── Apply index preserving axis order ─────────────────────────────────
+        # Apply one entry at a time, tracking the live dimension position.
+        # np.take(axis=dim) restricts a list index on a specific axis without
+        # disturbing any other axis — avoids numpy advanced-indexing promotion
+        # that would move fancy-indexed axes to the front.
         result = t
-
-        # Pass 1: scalars and slices (axis order preserved)
-        result = result[
-            tuple(slice(None) if isinstance(i, list) else i for i in full_idx)
-        ]
-
-        # Pass 2: fancy (list) indices via np.ix_ to avoid shape broadcasting
-        surviving = [i for i in full_idx if not isinstance(i, int)]
-        list_pos = [p for p, i in enumerate(surviving) if isinstance(i, list)]
-        if list_pos:
-            grid = np.ix_(*[surviving[p] for p in list_pos])
-            grid_idx = [slice(None)] * result.ndim
-            for p, g in zip(list_pos, grid):
-                grid_idx[p] = g
-            result = result[tuple(grid_idx)]
+        dim = 0  # current dim in result as preceding scalars collapse axes
+        for entry in full_idx:
+            if isinstance(entry, int):
+                # Scalar → collapse: index at current dim, dim does not advance
+                result = result[(slice(None),) * dim + (entry,)]
+            elif isinstance(entry, list):
+                # List → restrict in place, axis stays at dim
+                result = np.take(result, entry, axis=dim)
+                dim += 1
+            else:
+                # slice(None) → keep all, advance
+                dim += 1
 
         return SelectionResult(outcome=outcome, tensor=result, axes=axes_out)
 
