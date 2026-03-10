@@ -12,7 +12,7 @@ Design
 - Raw data per cell is an arbitrary Python object — no shape or type constraint.
 - Each OutcomeDef owns a sub-tensor of shape (*param_dims, *outcome_dims).
   A scalar outcome (shape ()) adds no extra axes.
-- select() resolves axis names from parameters and the chosen outcome's dim_axes.
+- select(filter={}) resolves axis names from parameters and the chosen outcome's dim_axes.
   Bare names work when unambiguous; 'p:name' / 'o:name' qualify when needed.
   Scalar value → axis collapsed; list of values → axis kept (restricted).
 
@@ -676,7 +676,7 @@ class SelectionResult:
         Examples
         --------
             # tensor shape (3, 3, 3, 2, 3, 4)  — 6 param axes
-            r = space.select("spectrum", axes={...})  # shape e.g. (3,2,51)
+            r = space.select("spectrum", filter={...})  # shape e.g. (3,2,51)
             sq = r.squeeze(["frequency"])   # keep freq bins, fold the rest
             # sq.tensor.shape == (6, 51)
             # sq.axes[0] is the combined AxisDef with 6 tuple values
@@ -968,7 +968,7 @@ class ExperimentSpace:
     def _resolve_axes(
         self,
         od: "OutcomeDef",
-        axes: dict[str, Any],
+        filter: dict[str, Any],
     ) -> tuple[dict[int, Any], dict[int, Any]]:
         """
         Translate a name-keyed axes dict into two index-keyed dicts:
@@ -996,7 +996,7 @@ class ExperimentSpace:
         param_sel: dict[int, Any] = {}
         outcome_sel: dict[int, Any] = {}
 
-        for key, val in axes.items():
+        for key, val in filter.items():
             if key.startswith("p:"):
                 name = key[2:]
                 if name not in p_names:
@@ -1043,7 +1043,7 @@ class ExperimentSpace:
     def select(
         self,
         outcome: str,
-        axes: dict[str, Any] | None = None,
+        filter: dict[str, Any] | None = None,
     ) -> SelectionResult:
         """
         Return a sub-tensor of one outcome, filtered and/or sliced by axis name.
@@ -1053,7 +1053,7 @@ class ExperimentSpace:
         outcome
             Name of the OutcomeDef to query.
 
-        axes
+        filter
             Dict of {axis_name: value_or_list}.
 
             axis_name
@@ -1079,20 +1079,20 @@ class ExperimentSpace:
         Examples
         --------
             # Fix two params (collapsed), restrict spectrum frequencies (kept)
-            t, axes_out = space.select(
+            result = space.select(
                 "spectrum",
-                axes={
+                filter={
                     "thickness": 2,            # scalar → collapsed
                     "mode":      "low",        # scalar → collapsed
                     "frequency": [10, 50, 100],# list   → kept (3 values)
                 }
             )
-            # t.shape == (3, 2, 3, 4, 3)  [remaining params × 3 freqs]
+            # result.shape == (3, 2, 3, 4, 3)  [remaining params × 3 freq bins]
 
             # Ambiguous name — qualify explicitly
-            t, axes_out = space.select(
+            result = space.select(
                 "spectrum",
-                axes={
+                filter={
                     "p:frequency": [10, 100],  # the parameter axis
                     "o:frequency": [10, 50],   # the outcome dim_axis
                 }
@@ -1101,12 +1101,12 @@ class ExperimentSpace:
         t = self.get_outcome_tensor(outcome)
         od = self._outcome_by_name(outcome)
 
-        if not axes:
+        if not filter:
             # Return full tensor; axes_out = all param axes + all outcome axes
             axes_out = list(self.parameters) + list(od.dim_axes)
             return SelectionResult(outcome=outcome, tensor=t, axes=axes_out)
 
-        param_sel, outcome_sel = self._resolve_axes(od, axes)
+        param_sel, outcome_sel = self._resolve_axes(od, filter)
 
         # ── Build index tuple and axes_out in definition order ────────────────
         # Output axis order always mirrors the sub-tensor storage order:
@@ -1160,85 +1160,6 @@ class ExperimentSpace:
                 dim += 1
 
         return SelectionResult(outcome=outcome, tensor=result, axes=axes_out)
-
-    def slice_2d(
-        self,
-        outcome: str,
-        row: str,
-        col: str,
-        fixed: dict[str, Any] | None = None,
-    ) -> SelectionResult:
-        """
-        Convenience wrapper around select() for the common 2-D heatmap case.
-
-        Fix all axes except two (row and col), return a matrix and the two
-        AxisDef objects so the caller has labels, unit, and scale directly.
-
-        row / col may be parameter names or outcome dim_axis names (with the
-        same "p:" / "o:" qualification rules as select()).
-
-        fixed
-            Values for every axis *not* named in row or col.  Scalars only
-            (each fixes and collapses one axis).  May be omitted if row and
-            col together account for all axes.
-
-        Returns
-        -------
-        (matrix, row_axisdef, col_axisdef)
-            matrix is 2-D; NaN where no run has been logged.
-        """
-        all_axes = {**(fixed or {}), row: None, col: None}
-        # Build axes dict: fixed axes get scalar values (collapsed),
-        # row/col get None as sentinels — we pass slice(None) for them.
-        axes_dict: dict[str, Any] = {}
-        if fixed:
-            axes_dict.update(fixed)  # scalar → will be collapsed
-
-        # Call select with only the fixed axes; row and col remain free
-        sel = self.select(outcome, axes_dict if axes_dict else None)
-        t, axes_out = sel.tensor, sel.axes
-
-        # Find row and col positions in axes_out
-        def _find(name: str) -> int:
-            bare = name[2:] if name.startswith(("p:", "o:")) else name
-            for i, ax in enumerate(axes_out):
-                if ax.name == bare:
-                    return i
-            raise KeyError(
-                f"slice_2d: '{name}' not found in remaining axes "
-                f"{[a.name for a in axes_out]} after fixing {list(fixed or {})}"
-            )
-
-        ri = _find(row)
-        ci = _find(col)
-
-        if ri == ci:
-            raise ValueError(f"slice_2d: row and col refer to the same axis '{row}'")
-
-        # Collapse all remaining axes except row and col by taking index 0
-        keep = {ri, ci}
-        idx: list[Any] = []
-        for i in range(t.ndim):
-            if i in keep:
-                idx.append(slice(None))
-            else:
-                idx.append(0)
-        mat = t[tuple(idx)]
-
-        # Ensure row is axis 0, col is axis 1
-        # After collapsing, row and col are the only two axes left;
-        # figure out their new positions
-        surviving = sorted(keep)
-        new_ri = surviving.index(ri)
-        new_ci = surviving.index(ci)
-        if new_ri > new_ci:
-            mat = mat.T
-
-        return SelectionResult(
-            outcome=outcome,
-            tensor=mat,
-            axes=[axes_out[ri], axes_out[ci]],
-        )
 
     # ── Introspection ─────────────────────────────────────────────────────────
 
@@ -1510,7 +1431,7 @@ if __name__ == "__main__":
     print("\n── select: fix params (scalar), restrict freq (list) ──")
     r1 = space.select(
         "spectrum",
-        axes={
+        filter={
             "mode": "low",  # scalar → axis collapsed
             "temperature": 20,  # scalar → axis collapsed
             "material": "A",  # scalar → axis collapsed
@@ -1528,7 +1449,7 @@ if __name__ == "__main__":
     print("\n── select: restrict both a param and outcome axis ──")
     r2 = space.select(
         "spectrum",
-        axes={
+        filter={
             "thickness": [1, 5],  # list → kept, 2 thicknesses
             "mode": "low",
             "temperature": 20,
@@ -1545,7 +1466,7 @@ if __name__ == "__main__":
     print("\n── select: scalar collapse on outcome axis ──────────")
     r3 = space.select(
         "feature_stats",
-        axes={
+        filter={
             "feature": "feat_2",  # outcome dim_axis — scalar → collapsed
             "statistic": "std",  # outcome dim_axis — scalar → collapsed
         },
@@ -1555,7 +1476,7 @@ if __name__ == "__main__":
     print("\n── select: list on outcome axis, keep axis ──────────")
     r4 = space.select(
         "feature_stats",
-        axes={
+        filter={
             "statistic": ["mean", "std"],  # list → kept
         },
     )
@@ -1564,13 +1485,13 @@ if __name__ == "__main__":
     print("\n── select: ambiguous name → qualify with p: / o: ───")
     # "frequency" exists as both a parameter and spectrum's dim_axis
     try:
-        space.select("spectrum", axes={"frequency": [10, 50]})
+        space.select("spectrum", filter={"frequency": [10, 50]})
     except ValueError as e:
         print(f"   ambiguous: {e}")
 
     r5 = space.select(
         "spectrum",
-        axes={
+        filter={
             "p:frequency": [10, 100],  # the parameter axis
             "o:frequency": [10, 50],  # the spectrum dim_axis (freq bins)
             "mode": "low",
@@ -1580,38 +1501,6 @@ if __name__ == "__main__":
         },
     )
     print(f"   {r5!r}")
-
-    # ── slice_2d — now uses axis names for row/col ────────────────────────────
-
-    print("\n── slice_2d: grand_mean, thickness × frequency ──────")
-    s1 = space.slice_2d(
-        outcome="grand_mean",
-        row="thickness",
-        col="frequency",
-        fixed={"mode": "low", "temperature": 20, "material": "A", "sample_rate": 1000},
-    )
-    print(f"   {s1!r}")
-    print(f"   {s1.axis_label(0)}: {s1.labels(0)}")
-    print(f"   {s1.axis_label(1)}: {s1.labels(1)}")
-    print(f"   matrix:\n   {np.round(s1.tensor, 4)}")
-
-    print("\n── slice_2d: spectrum, thickness × freq bin ─────────")
-    # Row = thickness (param), col = frequency (outcome dim_axis)
-    # "frequency" is ambiguous — qualify
-    s2 = space.slice_2d(
-        outcome="spectrum",
-        row="thickness",
-        col="o:frequency",  # outcome dim_axis, not param
-        fixed={
-            "p:frequency": 10,
-            "mode": "low",
-            "temperature": 20,
-            "material": "A",
-            "sample_rate": 1000,
-        },
-    )
-    print(f"   {s2!r}")
-    print(f"   matrix (first 5 cols):\n   {np.round(s2.tensor[:, :5], 4)}")
 
     # ── index_of with annotated strings ──────────────────────────────────────
 
@@ -1674,7 +1563,7 @@ if __name__ == "__main__":
     # Start with a selection that has multiple free axes
     r_multi = space.select(
         "spectrum",
-        axes={
+        filter={
             "p:frequency": 10,  # fix drive frequency
             "o:frequency": FREQ_BINS[:10],  # keep first 10 freq bins
         },
@@ -1706,7 +1595,7 @@ if __name__ == "__main__":
     # All axes named — reorder only, no combined axis
     r_small = space.select(
         "spectrum",
-        axes={
+        filter={
             "p:frequency": 10,
             "mode": "low",
             "temperature": 20,
@@ -1728,7 +1617,7 @@ if __name__ == "__main__":
     # 1-D: feature_means for a single cell — all features along one run
     r_1d = space.select(
         "feature_means",
-        axes={
+        filter={
             "thickness": 2,
             "p:frequency": 10,
             "mode": "mid",
@@ -1745,7 +1634,7 @@ if __name__ == "__main__":
     # 2-D: spectrum outcome, thickness × frequency bins (restricted)
     r_2d = space.select(
         "spectrum",
-        axes={
+        filter={
             "p:frequency": 10,
             "mode": "low",
             "temperature": 20,
@@ -1762,7 +1651,7 @@ if __name__ == "__main__":
     # 3-D: feature_stats — thickness × feature × statistic, fix remaining params
     r_3d = space.select(
         "feature_stats",
-        axes={
+        filter={
             "thickness": [1, 2, 5],  # list → kept (slices)
             "p:frequency": 10,
             "mode": "low",
