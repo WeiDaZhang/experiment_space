@@ -63,6 +63,32 @@ class AxisDef:
     def __post_init__(self):
         if len(self.values) == 0:
             raise ValueError(f"AxisDef '{self.name}': values must be non-empty")
+
+        # Normalise annotated string values (e.g. "10Hz", "1 mm") to bare
+        # numeric values at construction time, using the same parsing logic as
+        # index_of().  This ensures labels are never double-annotated.
+        normalised = []
+        for v in self.values:
+            if isinstance(v, str):
+                m = _MAGNITUDE_RE.match(v)
+                if m:
+                    mag_str, unit_str = m.group(1), m.group(2)
+                    if self.unit is None:
+                        raise ValueError(
+                            f"AxisDef '{self.name}' has no unit but value "
+                            f"{v!r} looks like an annotated string. "
+                            f"Pass bare values or set a unit."
+                        )
+                    if unit_str != self.unit:
+                        raise ValueError(
+                            f"AxisDef '{self.name}' (unit='{self.unit}'): "
+                            f"unit mismatch in value {v!r} — got '{unit_str}'."
+                        )
+                    mag = float(mag_str)
+                    v = int(mag) if mag == int(mag) else mag
+            normalised.append(v)
+        self.values = normalised
+
         if len(self.values) != len(set(map(str, self.values))):
             raise ValueError(f"AxisDef '{self.name}': values must be unique")
         if self.scale not in ("linear", "log"):
@@ -930,9 +956,9 @@ class ExperimentSpace:
             else:
                 val = param_sel[pi]
                 if isinstance(val, list):
-                    full_idx.append([p.index_of(v) for v in val])
                     idxs = [p.index_of(v) for v in val]
-                    bare_vals = [p.values[i] for i in idxs]
+                    bare_vals = [p.values[i] for i in idxs]  # resolved bare values
+                    full_idx.append(idxs)
                     axes_out.append(AxisDef(p.name, bare_vals, p.unit, p.scale))
                 else:
                     full_idx.append(p.index_of(val))  # scalar → collapsed
@@ -944,8 +970,10 @@ class ExperimentSpace:
             else:
                 val = outcome_sel[oi]
                 if isinstance(val, list):
-                    full_idx.append([ax.index_of(v) for v in val])
-                    axes_out.append(AxisDef(ax.name, val, ax.unit, ax.scale))
+                    idxs = [ax.index_of(v) for v in val]
+                    bare_vals = [ax.values[i] for i in idxs]  # resolved bare values
+                    full_idx.append(idxs)
+                    axes_out.append(AxisDef(ax.name, bare_vals, ax.unit, ax.scale))
                 else:
                     full_idx.append(ax.index_of(val))  # scalar → collapsed
 
