@@ -931,7 +931,9 @@ class ExperimentSpace:
                 val = param_sel[pi]
                 if isinstance(val, list):
                     full_idx.append([p.index_of(v) for v in val])
-                    axes_out.append(AxisDef(p.name, val, p.unit, p.scale))
+                    idxs = [p.index_of(v) for v in val]
+                    bare_vals = [p.values[i] for i in idxs]
+                    axes_out.append(AxisDef(p.name, bare_vals, p.unit, p.scale))
                 else:
                     full_idx.append(p.index_of(val))  # scalar → collapsed
 
