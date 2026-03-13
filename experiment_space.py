@@ -32,6 +32,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import matplotlib.pyplot as plt
+
 # Matches an optional sign, integer or decimal magnitude (incl. scientific
 # notation), optional whitespace, then the rest as a unit.
 # Examples: "1mm"  "1.5 mm"  "-10°C"  "0.01pF"  "1e3Hz"  "100 kHz"
@@ -639,6 +641,88 @@ class SelectionResult:
             tensor=t_reshaped,
             axes=[combined_ax] + keep_axes,
         )
+
+    def plot_grid_slices(
+        self,
+        fig_col_axis_name: str,
+        fn: Callable = lambda x: 20 * np.log10(np.abs(x)),
+        value_space_label: str = "Magnitude (dB)",
+    ) -> None:
+        plot_axes = {
+            "fig_row": {
+                "name": f"Combined axis: {self.axes[0].name}",
+                "axis": self.axes[0],
+                "idx": 0,
+                "size": len(self.axes[0].values),
+            }
+        }
+        fig_col_axis_idx = [
+            idx for idx, axis in enumerate(self.axes) if axis.name == fig_col_axis_name
+        ][0]
+        plot_axes["fig_col"] = {
+            "name": fig_col_axis_name,
+            "axis": self.axes[fig_col_axis_idx],
+            "idx": fig_col_axis_idx,
+            "size": len(self.axes[fig_col_axis_idx].values),
+        }
+        axis_idx_left = [
+            idx + 1
+            for idx, axis in enumerate(self.axes[1:])
+            if axis.name != fig_col_axis_name
+        ]
+        plot_axes["plot_row"] = {
+            "name": self.axes[axis_idx_left[0]].name,
+            "axis": self.axes[axis_idx_left[0]],
+            "idx": axis_idx_left[0],
+            "size": len(self.axes[axis_idx_left[0]].values),
+        }
+        plot_axes["plot_col"] = {
+            "name": self.axes[axis_idx_left[1]].name,
+            "axis": self.axes[axis_idx_left[1]],
+            "idx": axis_idx_left[1],
+            "size": len(self.axes[axis_idx_left[1]].values),
+        }
+
+        # ── Compute global value range ────────────────────────────────────────────
+        tensor_value_space = fn(self.tensor)
+        vmin, vmax = np.nanmin(tensor_value_space), np.nanmax(tensor_value_space)
+
+        # ── Plot ──────────────────────────────────────────────────────────────────
+        fig, axes_grid = plt.subplots(
+            plot_axes["fig_row"]["size"],
+            plot_axes["fig_col"]["size"],
+            figsize=(12, 5),
+        )
+
+        for r_idx in range(plot_axes["fig_row"]["size"]):
+            for c_idx in range(plot_axes["fig_col"]["size"]):
+                ax = axes_grid[r_idx, c_idx]
+                plot_slice = np.take(
+                    self.tensor, indices=c_idx, axis=plot_axes["fig_col"]["idx"]
+                )
+                plot_slice = plot_slice[r_idx, :, :]
+
+                mesh = ax.pcolormesh(
+                    plot_axes["plot_col"]["axis"].values,
+                    plot_axes["plot_row"]["axis"].values,
+                    fn(plot_slice),
+                    cmap="viridis",
+                    shading="auto",
+                    vmin=vmin,
+                    vmax=vmax,
+                )
+                ax.set_title(
+                    f"{plot_axes['fig_row']['axis'].labels[r_idx]} / "
+                    f"{plot_axes['fig_col']['axis'].labels[c_idx]}"
+                )
+                ax.set_xlabel(plot_axes["plot_col"]["axis"].axis_label)
+                ax.set_ylabel(plot_axes["plot_row"]["axis"].axis_label)
+
+        # ── Single shared colorbar on the right ───────────────────────────────────
+        fig.colorbar(mesh, ax=axes_grid, label=value_space_label, location="right")
+
+        plt.tight_layout()
+        plt.show()
 
     # ── Repr ──────────────────────────────────────────────────────────────────
 
