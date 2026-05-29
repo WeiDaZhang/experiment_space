@@ -648,6 +648,41 @@ class SelectionResult:
         fn: Callable = lambda x: 20 * np.log10(np.abs(x)),
         value_space_label: str = "Magnitude (dB)",
     ) -> None:
+        def _format_axis_value(axis: AxisDef, value: Any) -> str:
+            return axis.label(value)
+
+        def _make_coord_formatter(
+            x_axis: AxisDef,
+            y_axis: AxisDef,
+            value_axis_label: str,
+            x_coords: np.ndarray,
+            y_coords: np.ndarray,
+            z_values: np.ndarray,
+        ) -> Callable[[float, float], str]:
+            x_coords = np.asarray(x_coords)
+            y_coords = np.asarray(y_coords)
+            z_values = np.asarray(z_values)
+
+            def _formatter(x: float, y: float) -> str:
+                if x_coords.size == 0 or y_coords.size == 0 or z_values.size == 0:
+                    return f"x={x:0.4g}, y={y:0.4g}"
+
+                x_idx = int(np.argmin(np.abs(x_coords - x)))
+                y_idx = int(np.argmin(np.abs(y_coords - y)))
+
+                x_val = x_coords[x_idx]
+                y_val = y_coords[y_idx]
+                z_val = z_values[y_idx, x_idx]
+
+                z_text = f"{z_val:0.6g}" if np.isfinite(z_val) else str(z_val)
+                return (
+                    f"{x_axis.name}={_format_axis_value(x_axis, x_val)}, "
+                    f"{y_axis.name}={_format_axis_value(y_axis, y_val)}, "
+                    f"{value_axis_label}={z_text}"
+                )
+
+            return _formatter
+
         plot_axes = {
             "fig_row": {
                 "name": f"Combined axis: {self.axes[0].name}",
@@ -693,6 +728,10 @@ class SelectionResult:
             plot_axes["fig_col"]["size"],
             figsize=(12, 5),
         )
+        axes_grid = np.asarray(axes_grid, dtype=object).reshape(
+            plot_axes["fig_row"]["size"],
+            plot_axes["fig_col"]["size"],
+        )
 
         for r_idx in range(plot_axes["fig_row"]["size"]):
             for c_idx in range(plot_axes["fig_col"]["size"]):
@@ -701,11 +740,12 @@ class SelectionResult:
                     self.tensor, indices=c_idx, axis=plot_axes["fig_col"]["idx"]
                 )
                 plot_slice = plot_slice[r_idx, :, :]
+                plot_values = np.asarray(fn(plot_slice))
 
                 mesh = ax.pcolormesh(
                     plot_axes["plot_col"]["axis"].values,
                     plot_axes["plot_row"]["axis"].values,
-                    fn(plot_slice),
+                    plot_values,
                     cmap="viridis",
                     shading="auto",
                     vmin=vmin,
@@ -717,9 +757,17 @@ class SelectionResult:
                 )
                 ax.set_xlabel(plot_axes["plot_col"]["axis"].axis_label)
                 ax.set_ylabel(plot_axes["plot_row"]["axis"].axis_label)
+                ax.format_coord = _make_coord_formatter(
+                    x_axis=plot_axes["plot_col"]["axis"],
+                    y_axis=plot_axes["plot_row"]["axis"],
+                    value_axis_label=value_space_label,
+                    x_coords=plot_axes["plot_col"]["axis"].values,
+                    y_coords=plot_axes["plot_row"]["axis"].values,
+                    z_values=plot_values,
+                )
 
         # ── Single shared colorbar on the right ───────────────────────────────────
-        fig.colorbar(mesh, ax=axes_grid, label=value_space_label, location="right")
+        fig.colorbar(mesh, ax=axes_grid, label=value_space_label, location="left")
 
         plt.tight_layout()
         plt.show()
